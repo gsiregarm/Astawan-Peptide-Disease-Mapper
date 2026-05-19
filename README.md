@@ -1,5 +1,5 @@
 # Astawan-Peptide-Disease-Mapper
-# Functional Peptidomics & Network Pharmacology Pipeline
+# Functional Biomimetic Peptides & Network Pharmacology Pipeline
 
 **Author:** M. Ghassan Fattah
 **Institution:** Master's Program in Food Science, IPB University  
