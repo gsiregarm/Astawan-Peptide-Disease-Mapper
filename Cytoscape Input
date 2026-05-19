@@ -1,0 +1,113 @@
+# @title 3. Build Unified Master Network (Bipartite + STRING PPI)
+import pandas as pd
+import requests
+import os
+
+try:
+    from google.colab import files
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+
+print("⚙️ Building Master Unified Network...")
+input_file = "Pipeline_Results_Cleaned.csv"
+
+# --- SMART FILE LOADING ---
+if not os.path.exists(input_file):
+    if IN_COLAB:
+        print(f"⚠️ '{input_file}' not found in the local environment.")
+        print("👇 Please upload your pipeline results CSV file:")
+        uploaded = files.upload()
+        if not uploaded:
+            raise FileNotFoundError("Upload cancelled. Cannot proceed.")
+        input_file = next(iter(uploaded))
+    else:
+        raise FileNotFoundError(f"❌ Error: '{input_file}' not found.")
+else:
+    print(f"✅ Found '{input_file}' locally. Proceeding...")
+
+# Load the data
+df = pd.read_csv(input_file)
+df_clean = df.dropna(subset=['Cleaned_Sequence', 'Target_Gene', 'Top_Disease']).copy()
+
+# --- PART 1: BIPARTITE EDGES ---
+# 1. Peptide -> Primary Target
+edges_pt = df_clean[['Cleaned_Sequence', 'Target_Gene', 'SW_Score']].copy()
+edges_pt.columns = ['Source', 'Target', 'Weight']
+edges_pt['Interaction'] = 'binds_to'
+
+# 2. Primary Target -> Disease
+edges_td = df_clean[['Target_Gene', 'Top_Disease', 'Confidence']].copy()
+edges_td.columns = ['Source', 'Target', 'Weight']
+edges_td['Interaction'] = 'associated_with'
+
+# 3. Other Targets -> Disease
+other_targets_df = df_clean[['Top_Disease', 'Other_Disease_Targets', 'Confidence']].copy()
+other_targets_df = other_targets_df[other_targets_df['Other_Disease_Targets'] != "None"]
+other_targets_df['Other_Disease_Targets'] = other_targets_df['Other_Disease_Targets'].str.split(', ')
+other_targets_df = other_targets_df.explode('Other_Disease_Targets')
+
+# CRITICAL FIX: Strip all hidden whitespaces that cause Cytoscape duplicates
+other_targets_df['Other_Disease_Targets'] = other_targets_df['Other_Disease_Targets'].str.strip()
+
+edges_ot_d = other_targets_df[['Other_Disease_Targets', 'Top_Disease', 'Confidence']].copy()
+edges_ot_d.columns = ['Source', 'Target', 'Weight']
+edges_ot_d['Interaction'] = 'associated_with'
+edges_ot_d['Weight'] = edges_ot_d['Weight'] * 0.8 # Slightly lower weight for secondary targets
+
+bipartite_edges = pd.concat([edges_pt, edges_td, edges_ot_d], ignore_index=True)
+
+# --- PART 2: STRING PPI EDGES ---
+print("🕸️ Fetching Protein-Protein Interactions from STRING API...")
+# Gather all clean unique targets
+all_targets = list(set(edges_pt['Target'].tolist() + edges_ot_d['Source'].tolist()))
+all_targets = [g for g in all_targets if pd.notna(g) and g != "None"]
+
+string_api_url = "https://version-12-0.string-db.org/api/json/network"
+params = {
+    "identifiers": "\r".join(all_targets),
+    "species": 9606,
+    "required_score": 400,
+    "caller_identity": "colab_pipeline"
+}
+
+response = requests.post(string_api_url, data=params)
+
+string_edges = []
+if response.status_code == 200 and response.json():
+    for interaction in response.json():
+        string_edges.append({
+            "Source": interaction['preferredName_A'].strip(), # Strip to ensure perfect match
+            "Target": interaction['preferredName_B'].strip(), # Strip to ensure perfect match
+            "Interaction": "physical_interaction",
+            "Weight": interaction['score']
+        })
+
+df_string = pd.DataFrame(string_edges)
+
+# --- PART 3: MERGE INTO MASTER FILES ---
+master_edges = pd.concat([bipartite_edges, df_string], ignore_index=True)
+
+# Group by to completely eliminate any duplicate edges
+master_edges = master_edges.groupby(['Source', 'Target', 'Interaction']).agg({'Weight': 'max'}).reset_index()
+
+# Build Master Nodes Table
+nodes_pep = pd.DataFrame({'Node': edges_pt['Source'].unique(), 'Type': 'Peptide'})
+nodes_tar = pd.DataFrame({'Node': edges_td['Source'].unique(), 'Type': 'Primary_Target'})
+nodes_dis = pd.DataFrame({'Node': edges_td['Target'].unique(), 'Type': 'Disease'})
+nodes_oth = pd.DataFrame({'Node': edges_ot_d['Source'].unique(), 'Type': 'Associated_Target'})
+
+master_nodes = pd.concat([nodes_pep, nodes_tar, nodes_dis, nodes_oth], ignore_index=True)
+master_nodes = master_nodes.drop_duplicates(subset=['Node'], keep='first')
+
+# Export
+edge_file = 'Cytoscape_MASTER_Edges.csv'
+node_file = 'Cytoscape_MASTER_Nodes.csv'
+master_edges.to_csv(edge_file, index=False)
+master_nodes.to_csv(node_file, index=False)
+
+print(f"✅ Generated Unified Master Network: {len(master_edges)} Edges, {len(master_nodes)} Nodes.")
+
+if IN_COLAB:
+    files.download(edge_file)
+    files.download(node_file)
