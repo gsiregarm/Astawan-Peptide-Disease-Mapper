@@ -1,0 +1,152 @@
+# @title 4.2 Enrichr Analysis (OMIM & KEGG) + Gemini ICD-10 Classification & Plot
+# UPDATE: Added seaborn and matplotlib, and forcing an upgrade on the genai package
+!pip install -U -q google-generativeai seaborn matplotlib
+
+import requests
+import json
+import pandas as pd
+import google.generativeai as genai
+import matplotlib.pyplot as plt
+import seaborn as sns
+from google.colab import files, userdata
+
+print("🔬 Running Gene Enrichment Analysis (OMIM & KEGG), ICD-10 Classification & Plotting...\n")
+
+# 1. API Key Request via Colab Secrets
+try:
+    print("🔑 Authenticating via Colab Secrets...")
+    # Kept exact API_Key parameter per your instruction
+    GEMINI_API_KEY = userdata.get('API_Key')
+    genai.configure(api_key=GEMINI_API_KEY)
+    print("✅ API Key successfully loaded!")
+except userdata.SecretNotFoundError:
+    print("❌ Error: 'API_Key' secret not found!")
+    raise Exception("API Key missing. Cannot proceed.")
+
+# 2. Interactive File Upload
+print("\n👇 Please upload your pipeline results CSV file:")
+uploaded = files.upload()
+
+if not uploaded:
+    print("❌ Upload cancelled. Cannot proceed.")
+else:
+    input_filename = next(iter(uploaded))
+    
+    try:
+        final_df = pd.read_csv(input_filename)
+        print(f"✅ Successfully loaded '{input_filename}'.")
+        
+        if 'Target_Gene' not in final_df.columns:
+            raise ValueError("The uploaded file does not contain a 'Target_Gene' column.")
+
+        unique_genes = final_df['Target_Gene'].dropna().unique().tolist()
+        genes_str = '\n'.join(unique_genes)
+
+        # 3. Upload to Enrichr
+        ENRICHR_URL = 'http://maayanlab.cloud/Enrichr/addList'
+        payload = {'list': (None, genes_str), 'description': (None, 'Pipeline_Targets')}
+        response = requests.post(ENRICHR_URL, files=payload)
+
+        if response.status_code == 200:
+            user_list_id = response.json().get('userListId')
+            LIBRARIES = ['OMIM_Disease', 'KEGG_2021_Human']
+            significant_results = {}
+            all_results = {} # NEW: Dictionary to hold ALL annotated results
+
+            # 4. Query Enrichr Libraries
+            for lib in LIBRARIES:
+                QUERY_URL = f'http://maayanlab.cloud/Enrichr/enrich?userListId={user_list_id}&backgroundType={lib}'
+                resp = requests.get(QUERY_URL)
+
+                if resp.status_code == 200:
+                    results = resp.json().get(lib, [])
+                    enrichment_data = [{"Term": r[1], "P-value": r[2]} for r in results]
+                    df_enrichr = pd.DataFrame(enrichment_data)
+                    
+                    # Store ALL results for the visualization
+                    all_results[lib] = df_enrichr 
+                    
+                    # Keep track of significant ones for printing/other uses
+                    df_sig = df_enrichr[df_enrichr['P-value'] < 0.05].copy() if not df_enrichr.empty else pd.DataFrame()
+                    significant_results[lib] = df_sig
+                    
+                    print(f"✅ [{lib}] Found {len(df_enrichr)} total annotated associations ({len(df_sig)} significant p < 0.05).")
+                else:
+                    print(f"❌ Failed to query {lib} library.")
+
+            # 5. Gemini ICD-10 Classification
+            # FIX: Now grabbing from all_results instead of significant_results
+            omim_df = all_results.get('OMIM_Disease', pd.DataFrame())
+            
+            if not omim_df.empty:
+                print(f"\n🤖 Sending all {len(omim_df)} annotated diseases to Gemini for ICD-10 Classification...")
+                disease_list = omim_df['Term'].tolist()
+                
+                prompt = f"""
+                You are a medical informatics expert. Map the following list of diseases to their most accurate ICD-10 code and broad category. 
+                Return ONLY a valid JSON object. Do not include markdown formatting like ```json.
+                The keys must be the EXACT disease names provided below. 
+                The values must be an object with "ICD_10_Code" and "ICD_10_Category".
+                
+                Diseases to map:
+                {json.dumps(disease_list)}
+                """
+                
+                try:
+                    # Kept gemini-2.5-flash per your instruction
+                    model = genai.GenerativeModel('gemini-2.5-flash')
+                    ai_response = model.generate_content(prompt)
+                    
+                    clean_json = ai_response.text.strip().removeprefix('```json').removesuffix('```').strip()
+                    icd10_mapping = json.loads(clean_json)
+                    
+                    omim_df['ICD_10_Code'] = omim_df['Term'].map(lambda x: icd10_mapping.get(x, {}).get('ICD_10_Code', 'Unmapped'))
+                    omim_df['ICD_10_Category'] = omim_df['Term'].map(lambda x: icd10_mapping.get(x, {}).get('ICD_10_Category', 'Unmapped'))
+                    
+                    print("✅ ICD-10 Classification Complete!")
+                    
+                    # --- 6. DATA VISUALIZATION (THE BAR CHART) ---
+                    print("📊 Generating ICD-10 Category Distribution Chart...")
+                    
+                    # Filter out Unmapped or NaN values for a cleaner chart
+                    valid_categories = omim_df[omim_df['ICD_10_Category'] != 'Unmapped']
+                    category_counts = valid_categories['ICD_10_Category'].value_counts().reset_index()
+                    category_counts.columns = ['ICD-10 Category', 'Number of Diseases']
+                    
+                    if not category_counts.empty:
+                        plt.figure(figsize=(10, 6))
+                        sns.barplot(
+                            data=category_counts, 
+                            x='Number of Diseases', 
+                            y='ICD-10 Category', 
+                            palette='viridis',
+                            edgecolor=".2"
+                        )
+                        
+                        plt.title('Count of OMIM Diseases per ICD-10 Category (All Annotations)', fontsize=14, pad=15)
+                        plt.xlabel('Number of Diseases', fontsize=12)
+                        plt.ylabel('ICD-10 Category', fontsize=12)
+                        
+                        sns.despine()
+                        plt.tight_layout()
+                        
+                        chart_filename = 'ICD10_Category_Distribution_All.png'
+                        plt.savefig(chart_filename, dpi=300, bbox_inches='tight')
+                        plt.show()
+                        files.download(chart_filename)
+                    else:
+                        print("⚠️ Not enough mapped data to generate a chart.")
+
+                except Exception as e:
+                    print(f"⚠️ Gemini Classification failed (skipping mapping and chart): {e}")
+                
+                omim_filename = "OMIM_ICD10_All_Results.csv"
+                omim_df.to_csv(omim_filename, index=False)
+                files.download(omim_filename)
+                
+            else:
+                print("⚠️ No OMIM diseases found to classify.")
+        else:
+            print("❌ Failed to upload list to Enrichr.")
+    except Exception as e:
+        print(f"❌ Error processing file: {e}")
