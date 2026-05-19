@@ -1,0 +1,61 @@
+# @title 1. Environment Setup & Data Prep
+!pip install biopython requests pandas tqdm -q
+
+import pandas as pd
+import requests
+import gzip
+import io
+import re
+from Bio import SeqIO
+from google.colab import files
+
+# --- CONFIGURATION ---
+print("👇 Please upload your starting peptides CSV file:")
+data_input = files.upload()
+INPUT_FILENAME = next(iter(data_input))
+
+# Global Proteome Dictionary
+HUMAN_PROTEOME = {}
+
+def sanitize_sequence(seq):
+    """Removes PTMs and maps ambiguous chars to standard 20 AAs."""
+    if pd.isna(seq): return ""
+    cleaned = re.sub(r'\(.*?\)', '', str(seq))
+    cleaned = re.sub(r'[^A-Z]', '', cleaned.upper())
+    # Fix Ambiguous/Rare Amino Acids
+    replacements = {'J': 'L', 'U': 'C', 'O': 'K', 'B': 'D', 'Z': 'E', 'X': 'A'}
+    for old, new in replacements.items():
+        cleaned = cleaned.replace(old, new)
+    return cleaned
+
+def load_proteome():
+    """Downloads Swiss-Prot Human Proteome."""
+    global HUMAN_PROTEOME
+    print("\n📥 Downloading Human Reviewed Proteome (Swiss-Prot)...")
+    url = "https://rest.uniprot.org/uniprotkb/stream?format=fasta&query=%28proteome%3AUP000005640%29+AND+%28reviewed%3Atrue%29&compressed=true"
+
+    response = requests.get(url)
+    if response.status_code == 200:
+        fasta_content = gzip.decompress(response.content).decode('utf-8')
+        for record in SeqIO.parse(io.StringIO(fasta_content), "fasta"):
+            clean_seq = sanitize_sequence(str(record.seq))
+            desc = record.description
+            gene_name = desc.split("GN=")[1].split(" ")[0] if "GN=" in desc else record.id
+            HUMAN_PROTEOME[gene_name] = clean_seq
+        print(f"✅ Proteome Ready: {len(HUMAN_PROTEOME)} proteins loaded.")
+    else:
+        raise ConnectionError("Failed to download proteome.")
+
+# Execution
+try:
+    df = pd.read_csv(INPUT_FILENAME)
+    print("🧹 Sanitizing peptide sequences...")
+    df['Cleaned_Sequence'] = df['Peptide'].apply(sanitize_sequence)
+
+    unique_peptides = df[['Cleaned_Sequence']].drop_duplicates().reset_index(drop=True)
+    unique_peptides = unique_peptides[unique_peptides['Cleaned_Sequence'].str.len() >= 4]
+    print(f"✅ Data Ready: {len(unique_peptides)} valid, unique peptides to align.")
+
+    load_proteome()
+except Exception as e:
+    print(f"❌ Error: {e}")
