@@ -1,0 +1,135 @@
+# @title 2B. Deep Disease Mapping (Open Targets)
+import os
+import concurrent.futures
+import pandas as pd
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from tqdm.notebook import tqdm
+
+try:
+    from google.colab import files
+    IN_COLAB = True
+except ImportError:
+    IN_COLAB = False
+
+intermediate_file = "Intermediate_Alignment.csv"
+
+# --- SMART FILE LOADING ---
+if not os.path.exists(intermediate_file):
+    if IN_COLAB:
+        print(f"⚠️ '{intermediate_file}' not found in the current environment.")
+        print("👇 Please upload your intermediate alignment file manually:")
+        uploaded = files.upload()
+        if not uploaded:
+            raise FileNotFoundError("Upload cancelled. Cannot proceed.")
+        # Grab the uploaded filename
+        intermediate_file = next(iter(uploaded))
+    else:
+        raise FileNotFoundError(f"❌ Error: '{intermediate_file}' not found.")
+else:
+    print(f"✅ Found '{intermediate_file}' locally. Proceeding...")
+
+# Load the alignment results
+hits_df = pd.read_csv(intermediate_file)
+
+# Ensure Target_Gene exists to avoid KeyError
+if 'Target_Gene' not in hits_df.columns:
+    raise ValueError("The uploaded file does not contain a 'Target_Gene' column.")
+
+unique_genes = hits_df['Target_Gene'].dropna().unique()
+
+def get_deep_disease_data(gene_symbol):
+    if pd.isna(gene_symbol) or gene_symbol in ["No_Significant_Match", "None"]:
+        return ("None", 0.0, "None")
+
+    url = "https://api.platform.opentargets.org/api/v4/graphql"
+    query_id = """query Search($symbol: String!) { search(queryString: $symbol, entityNames: ["target"], page: {index: 0, size: 1}) { hits { id } } }"""
+    query_assoc = """
+    query GetDiseases($id: String!) {
+      target(ensemblId: $id) {
+        associatedDiseases(page: {index: 0, size: 1}) {
+          rows {
+            disease {
+              name
+              associatedTargets(page: {index: 0, size: 6}) {
+                rows { target { approvedSymbol } }
+              }
+            }
+            score
+          }
+        }
+      }
+    }
+    """
+
+    try:
+        session = requests.Session()
+        retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503, 504])
+        session.mount('https://', HTTPAdapter(max_retries=retries))
+
+        # Step 1: Get Ensembl ID
+        r = session.post(url, json={"query": query_id, "variables": {"symbol": gene_symbol}}, timeout=5)
+        hits = r.json().get('data', {}).get('search', {}).get('hits', [])
+        if not hits: return ("None", 0.0, "None")
+
+        target_id = hits[0]['id']
+
+        # Step 2: Get Deep Disease Data
+        r2 = session.post(url, json={"query": query_assoc, "variables": {"id": target_id}}, timeout=5)
+        rows = r2.json().get('data', {}).get('target', {}).get('associatedDiseases', {}).get('rows', [])
+
+        if rows:
+            disease_name = rows[0]['disease']['name']
+            disease_score = round(rows[0]['score'], 4)
+
+            assoc_targets = rows[0]['disease'].get('associatedTargets', {}).get('rows', [])
+            other_targets = [
+                t['target']['approvedSymbol']
+                for t in assoc_targets
+                if t.get('target') and t['target']['approvedSymbol'] != gene_symbol
+            ]
+
+            other_targets_str = ", ".join(other_targets[:5]) if other_targets else "None"
+            return (disease_name, disease_score, other_targets_str)
+
+        return ("No_Association", 0.0, "None")
+    except Exception:
+        return ("API_Error", 0.0, "None")
+
+print(f"🔗 Extracting deep network data for {len(unique_genes)} unique genes via Open Targets API...")
+gene_disease_map = {}
+
+with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    future_to_gene = {executor.submit(get_deep_disease_data, gene): gene for gene in unique_genes}
+    for future in tqdm(concurrent.futures.as_completed(future_to_gene), total=len(unique_genes), desc="Querying Open Targets"):
+        gene = future_to_gene[future]
+        gene_disease_map[gene] = future.result()
+
+# Map all results back to the dataframe
+hits_df['Top_Disease'] = hits_df['Target_Gene'].map(lambda x: gene_disease_map.get(x, ("None", 0, "None"))[0])
+hits_df['Confidence'] = hits_df['Target_Gene'].map(lambda x: gene_disease_map.get(x, ("None", 0, "None"))[1])
+hits_df['Other_Disease_Targets'] = hits_df['Target_Gene'].map(lambda x: gene_disease_map.get(x, ("None", 0, "None"))[2])
+
+# --- MEMORY SAFETY CHECK FOR MERGING ---
+# If the user restarted runtime and uploaded the file, 'df' from Cell 1 won't exist.
+if 'df' in locals() or 'df' in globals():
+    # Find columns that exist in both dataframes (except the key we are merging on)
+    overlap_cols = [col for col in hits_df.columns if col in df.columns and col != "Cleaned_Sequence"]
+    # Drop them from the original df so we don't get _x and _y suffixes
+    df_clean = df.drop(columns=overlap_cols)
+    final_df = df_clean.merge(hits_df, on="Cleaned_Sequence", how="left")
+else:
+    print("⚠️ Notice: Original 'df' from Cell 1 not found in memory. Saving mapped results directly.")
+    final_df = hits_df
+
+final_df.to_csv("Pipeline_Results_Cleaned.csv", index=False)
+
+print("\n✅ SUCCESS! Master file saved as Pipeline_Results_Cleaned.csv")
+
+# Safely display columns only if they actually exist in the dataframe
+cols_to_show = [c for c in ['Cleaned_Sequence', 'Target_Gene', 'Top_Disease', 'Other_Disease_Targets'] if c in final_df.columns]
+display(final_df[cols_to_show].dropna(subset=['Target_Gene']).head())
+
+if IN_COLAB:
+    files.download("Pipeline_Results_Cleaned.csv")
